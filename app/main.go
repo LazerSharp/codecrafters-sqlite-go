@@ -3,13 +3,15 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"strings"
+
 	// Available if you need it!
-	// "github.com/xwb1989/sqlparser"
+	"github.com/xwb1989/sqlparser"
 )
 
 type Header struct {
@@ -37,8 +39,12 @@ type PageHeader struct {
 	pageType   byte
 }
 
-func ReadPageHeader(r io.Reader) (*PageHeader, error) {
-
+func ReadPageHeader(r io.ReadSeeker, page int) (*PageHeader, error) {
+	offset := 0
+	if page == 1 {
+		offset = 100
+	}
+	JumpToPage(r, h.pageSize, page, offset)
 	// read sql_schema header
 	pageHeader := make([]byte, 8)
 	_, err := r.Read(pageHeader)
@@ -87,7 +93,7 @@ const (
 	_ // Reserved
 	_ // Reserved
 	Blob
-	String
+	StringVal
 )
 
 func (t ColumnSerialType) Type() ColumnType {
@@ -101,7 +107,7 @@ func (t ColumnSerialType) Type() ColumnType {
 	case (t >= 12) && ((t % 2) == 0):
 		return Blob
 	case (t >= 13) && ((t % 2) == 1):
-		return String
+		return StringVal
 	default:
 		return Null
 	}
@@ -114,7 +120,7 @@ func (st ColumnSerialType) Size() int64 {
 		return 1
 	case Blob:
 		return int64((st - 12) / 2)
-	case String:
+	case StringVal:
 		return int64((st - 13) / 2)
 	default:
 		return 0
@@ -149,7 +155,7 @@ func ReadColumn(ctyp *ColumnSerialType, r io.Reader) (*Column, error) {
 
 func (c Column) StringVal() string {
 	ctype := c.serialType.Type()
-	if ctype != String {
+	if ctype != StringVal {
 		log.Fatal("Column type is not string. It is %v instread.", ctype)
 	}
 	return string(c.bytes)
@@ -227,7 +233,7 @@ func ReadRecord(r io.Reader) (*Record, error) {
 
 }
 
-func ReadRecords(r io.ReadSeeker, numCells int16) (*[]Record, error) {
+func ReadRecords(r io.ReadSeeker, numCells int16, rootPage int) (*[]Record, error) {
 	// read cell pointer array
 	cellPointers := make([]int16, numCells)
 	recoreds := make([]Record, 0, numCells)
@@ -235,31 +241,26 @@ func ReadRecords(r io.ReadSeeker, numCells int16) (*[]Record, error) {
 		fmt.Fprintln(os.Stderr, "error reading cell pointers", err)
 		return nil, err
 	}
-
 	for _, cp := range cellPointers {
-		// fmt.Fprintf(os.Stderr, "Cell Pointer #%v : %v\n", i+1, cp)
-		r.Seek(int64(cp), 0)
+		JumpToPage(r, h.pageSize, rootPage, int(cp))
 		record, err := ReadRecord(r)
 		if err != nil {
 			return nil, err
 		}
 		recoreds = append(recoreds, *record)
 	}
-
 	return &recoreds, nil
-
 }
 
-func ReadPage(r io.ReadSeeker) (*[]Record, error) {
-
-	pHeader, err := ReadPageHeader(r)
+func ReadPage(r io.ReadSeeker, rootPage int) (*[]Record, error) {
+	pHeader, err := ReadPageHeader(r, rootPage)
 	if err != nil {
-		log.Println("Failed to read file header", err)
+		log.Println("Failed to read file header: ", err)
 		return nil, err
 	}
-	records, err := ReadRecords(r, pHeader.numCell)
+	records, err := ReadRecords(r, pHeader.numCell, rootPage)
 	if err != nil {
-		log.Println("Failed to read records", err)
+		log.Println("Failed to read records: ", err)
 		return nil, err
 	}
 	return records, nil
@@ -275,7 +276,7 @@ type SqlSchemaRecord struct {
 
 func ReadSqlSchema(r io.ReadSeeker) (*[]SqlSchemaRecord, error) {
 	// Assuming the head on page 1 and file header (initial 100 bytes) already consumed / skipped
-	records, _ := ReadPage(r)
+	records, _ := ReadPage(r, 1)
 	schemaRecods := make([]SqlSchemaRecord, 0, len(*records))
 
 	for _, rec := range *records {
@@ -292,6 +293,58 @@ func ReadSqlSchema(r io.ReadSeeker) (*[]SqlSchemaRecord, error) {
 
 }
 
+func parseDDL(ddlSql string) *sqlparser.DDL {
+
+	sql := strings.ReplaceAll(ddlSql, "autoincrement", "")
+	stmt, err := sqlparser.Parse(sql)
+	if err != nil {
+		log.Fatal("Error parsing SQL")
+	}
+
+	ddl, ok := stmt.(*sqlparser.DDL)
+	if !ok {
+		log.Fatal("Not a DDL statement")
+	}
+
+	return ddl
+
+}
+
+func parseSelectQuery(selectSql string) *sqlparser.Select {
+	stmt, err := sqlparser.Parse(selectSql)
+	if err != nil {
+		log.Fatal("Error parsing SQL")
+	}
+	selectStmt, ok := stmt.(*sqlparser.Select)
+	if !ok {
+		log.Fatal("Not a valid select stmt.")
+	}
+	return selectStmt
+}
+
+func fetchTableMetadata(r io.ReadSeeker, tableName string) (*SqlSchemaRecord, error) {
+	recs, err := ReadSqlSchema(r)
+	if err != nil {
+		return nil, err
+	}
+	for _, rec := range *recs {
+		if rec.TablName == tableName {
+			return &rec, nil
+		}
+	}
+	return nil, errors.New("Table not found")
+}
+
+func JumpToPage(seeker io.Seeker, pageSize uint16, page int, offset int) {
+	// jump to rootpage
+	_, err := seeker.Seek(int64(pageSize*uint16(page-1))+int64(offset), io.SeekStart)
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+var h *Header
+
 // Usage: your_program.sh sample.db .dbinfo
 func main() {
 	databaseFilePath := os.Args[1]
@@ -302,7 +355,6 @@ func main() {
 		log.Fatal(err)
 	}
 
-	var h *Header
 	if h, err = ReadHeader(databaseFile); err != nil {
 		log.Fatal("Failed to read file header", err)
 	}
@@ -322,37 +374,59 @@ func main() {
 		fmt.Printf("database page size: %v\n", h.pageSize)
 
 		var pHeader *PageHeader
-		if pHeader, err = ReadPageHeader(databaseFile); err != nil {
+		if pHeader, err = ReadPageHeader(databaseFile, 1); err != nil {
 			log.Fatal("Failed to read file header", err)
 		}
 
 		fmt.Printf("number of tables: %v\n", pHeader.numCell)
 
 	default:
-		arr := strings.Split(command, " ")
-		tblName := arr[len(arr)-1]
-		//fmt.Printf("Table name: [%v]\n", tblName)
 
-		recods, err := ReadSqlSchema(databaseFile)
+		// read select Query
+
+		selectQuery := command
+
+		selectStmt := parseSelectQuery(selectQuery)
+		tblName := sqlparser.String(selectStmt.From)
+		selectColumn := sqlparser.String(selectStmt.SelectExprs)
+		tblMetaData, err := fetchTableMetadata(databaseFile, tblName)
+
 		if err != nil {
-			log.Fatal(err)
+			log.Fatal("Error fetching meta data", err)
 		}
-		var rootPage int
-		for _, rec := range *recods {
-			if rec.TablName == tblName {
-				rootPage = rec.RootPage
+
+		switch {
+		case strings.ToUpper(selectColumn) == "COUNT(*)":
+
+			rootPage := tblMetaData.RootPage
+			tblHeader, err := ReadPageHeader(databaseFile, rootPage)
+			if err != nil {
+				log.Fatal("Uanble to read Page Header: ", err)
+			}
+			fmt.Println(tblHeader.numCell)
+
+		default:
+
+			ddlSql := tblMetaData.Sql
+			ddlStmt := parseDDL(ddlSql)
+
+			colIndex := -1
+			for i, col := range ddlStmt.TableSpec.Columns {
+				colName := col.Name.String()
+				if selectColumn == colName {
+					colIndex = i
+					break
+				}
+
+			}
+			rootPage := tblMetaData.RootPage
+			recs, err := ReadPage(databaseFile, rootPage)
+			if err != nil {
+				log.Fatal("Error reading page", err)
+			}
+			for _, rec := range *recs {
+				fmt.Println(rec.columns[colIndex].StringVal())
 			}
 		}
-		//fmt.Printf("Root Page #: [%v]\n", rootPage)
-
-		// jump to rootpage
-		_, err = databaseFile.Seek(int64(h.pageSize*uint16(rootPage-1)), io.SeekStart)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		tblHeader, err := ReadPageHeader(databaseFile)
-		fmt.Println(tblHeader.numCell)
-
 	}
 }
