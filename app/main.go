@@ -389,6 +389,12 @@ func main() {
 		selectStmt := parseSelectQuery(selectQuery)
 		tblName := sqlparser.String(selectStmt.From)
 		selectColumn := sqlparser.String(selectStmt.SelectExprs)
+
+		selectColumns := map[string]bool{}
+		for _, expr := range selectStmt.SelectExprs {
+			selectColumns[sqlparser.String(expr)] = true
+		}
+
 		tblMetaData, err := fetchTableMetadata(databaseFile, tblName)
 
 		if err != nil {
@@ -410,12 +416,11 @@ func main() {
 			ddlSql := tblMetaData.Sql
 			ddlStmt := parseDDL(ddlSql)
 
-			colIndex := -1
+			colIndices := make([]int, 0, len(ddlStmt.TableSpec.Columns))
 			for i, col := range ddlStmt.TableSpec.Columns {
 				colName := col.Name.String()
-				if selectColumn == colName {
-					colIndex = i
-					break
+				if selectColumns[colName] {
+					colIndices = append(colIndices, i)
 				}
 
 			}
@@ -425,7 +430,11 @@ func main() {
 				log.Fatal("Error reading page", err)
 			}
 			for _, rec := range *recs {
-				fmt.Println(rec.columns[colIndex].StringVal())
+				colVals := make([]string, 0, len(colIndices))
+				for _, colIndex := range colIndices {
+					colVals = append(colVals, rec.columns[colIndex].StringVal())
+				}
+				fmt.Println(strings.Join(colVals, "|"))
 			}
 		}
 	}
