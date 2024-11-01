@@ -353,6 +353,7 @@ func ParseWhereClause(selectStmt *sqlparser.Select) *WhereClause {
 		wsplit := strings.Split(sqlparser.String(where.Expr), "=")
 		whereColl := strings.TrimSpace(wsplit[0])
 		whereVal := strings.Trim(strings.TrimSpace(wsplit[1]), "'")
+		// fmt.Printf("Where stmt exists! coll=[%s] val=[%s]\n", whereColl, whereVal)
 		return &WhereClause{
 			Collumn: whereColl,
 			Value:   whereVal,
@@ -408,11 +409,6 @@ func main() {
 		tblName := sqlparser.String(selectStmt.From)
 		selectColumn := sqlparser.String(selectStmt.SelectExprs)
 
-		selectColumns := map[string]bool{}
-		for _, expr := range selectStmt.SelectExprs {
-			selectColumns[sqlparser.String(expr)] = true
-		}
-
 		tblMetaData, err := fetchTableMetadata(databaseFile, tblName)
 
 		if err != nil {
@@ -436,27 +432,41 @@ func main() {
 
 			where := ParseWhereClause(selectStmt)
 
+			selectColumns := make([]string, 0, len(selectStmt.SelectExprs))
+			for _, expr := range selectStmt.SelectExprs {
+				selectColumns = append(selectColumns, sqlparser.String(expr))
+			}
+
 			selectCollIndices := make([]int, 0, len(ddlStmt.TableSpec.Columns))
 			whereCollIndex := -1
+
+			collIndexMap := map[string]int{}
+
 			for i, col := range ddlStmt.TableSpec.Columns {
 				colName := col.Name.String()
-				if selectColumns[colName] {
-					selectCollIndices = append(selectCollIndices, i)
-				}
-				if where != nil && colName == where.Collumn {
-					whereCollIndex = i
-				}
-
+				collIndexMap[colName] = i
 			}
+
+			for _, scoll := range selectColumns {
+				selectCollIndices = append(selectCollIndices, collIndexMap[scoll])
+			}
+
+			if where != nil {
+				whereCollIndex = collIndexMap[where.Collumn]
+			}
+
 			rootPage := tblMetaData.RootPage
 			recs, err := ReadPage(databaseFile, rootPage)
 			if err != nil {
 				log.Fatal("Error reading page", err)
 			}
 
+			//fmt.Printf("whereCollIndex: %v\n", whereCollIndex)
+
 			for _, rec := range *recs {
 				if where != nil {
 					if rec.columns[whereCollIndex].StringVal() != where.Value {
+						// skip it!
 						continue
 					}
 				}
