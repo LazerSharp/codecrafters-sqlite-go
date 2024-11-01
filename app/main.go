@@ -343,6 +343,24 @@ func JumpToPage(seeker io.Seeker, pageSize uint16, page int, offset int) {
 	}
 }
 
+type WhereClause struct {
+	Collumn, Value string
+}
+
+func ParseWhereClause(selectStmt *sqlparser.Select) *WhereClause {
+	where := selectStmt.Where
+	if where != nil && where.Type == sqlparser.WhereStr {
+		wsplit := strings.Split(sqlparser.String(where.Expr), "=")
+		whereColl := strings.TrimSpace(wsplit[0])
+		whereVal := strings.Trim(strings.TrimSpace(wsplit[1]), "'")
+		return &WhereClause{
+			Collumn: whereColl,
+			Value:   whereVal,
+		}
+	}
+	return nil
+}
+
 var h *Header
 
 // Usage: your_program.sh sample.db .dbinfo
@@ -416,11 +434,17 @@ func main() {
 			ddlSql := tblMetaData.Sql
 			ddlStmt := parseDDL(ddlSql)
 
-			colIndices := make([]int, 0, len(ddlStmt.TableSpec.Columns))
+			where := ParseWhereClause(selectStmt)
+
+			selectCollIndices := make([]int, 0, len(ddlStmt.TableSpec.Columns))
+			whereCollIndex := -1
 			for i, col := range ddlStmt.TableSpec.Columns {
 				colName := col.Name.String()
 				if selectColumns[colName] {
-					colIndices = append(colIndices, i)
+					selectCollIndices = append(selectCollIndices, i)
+				}
+				if where != nil && colName == where.Collumn {
+					whereCollIndex = i
 				}
 
 			}
@@ -429,9 +453,15 @@ func main() {
 			if err != nil {
 				log.Fatal("Error reading page", err)
 			}
+
 			for _, rec := range *recs {
-				colVals := make([]string, 0, len(colIndices))
-				for _, colIndex := range colIndices {
+				if where != nil {
+					if rec.columns[whereCollIndex].StringVal() != where.Value {
+						continue
+					}
+				}
+				colVals := make([]string, 0, len(selectCollIndices))
+				for _, colIndex := range selectCollIndices {
 					colVals = append(colVals, rec.columns[colIndex].StringVal())
 				}
 				fmt.Println(strings.Join(colVals, "|"))
