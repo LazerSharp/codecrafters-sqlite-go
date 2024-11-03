@@ -33,14 +33,24 @@ func ReadHeader(r io.Reader) (*Header, error) {
 	return &h, nil
 }
 
+type PageType byte
+
+// page types
+const (
+	TableLeafPage     PageType = 0x0d // 13
+	TableInteriorPage PageType = 0x05 // 5
+	IndexLeafPage     PageType = 0x0a // 10
+	IndexInteriorPage PageType = 0x02 // 2
+)
+
 type PageHeader struct {
-	numCell    int16
-	pageNumber int32
-	pageType   byte
+	numCell      uint16
+	rightPageNum uint32 // pointer
+	pageType     byte
 }
 
-func ReadPageHeader(r io.ReadSeeker, page int) (*PageHeader, error) {
-	offset := 0
+func ReadPageHeader(r io.ReadSeeker, page uint32) (*PageHeader, error) {
+	offset := uint16(0)
 	if page == 1 {
 		offset = 100
 	}
@@ -60,16 +70,15 @@ func ReadPageHeader(r io.ReadSeeker, page int) (*PageHeader, error) {
 	}
 
 	// b-tree page type
-	h.pageType = pageHeader[0]
+	h.pageType = (pageHeader[0])
 
 	//fmt.Fprintf(os.Stderr, "Page type: %v\n", h.pageType)
-	if h.pageType == 2 || h.pageType == 5 { // interior page
-		var pageNumber int32
-		if err := binary.Read(r, binary.BigEndian, &h.pageNumber); err != nil {
+	if PageType(h.pageType) == TableInteriorPage || PageType(h.pageType) == IndexInteriorPage { // interior page
+		if err := binary.Read(r, binary.BigEndian, &h.rightPageNum); err != nil {
 			fmt.Println("Failed to read integer:", err)
 			return nil, err
 		}
-		fmt.Fprintf(os.Stderr, "Page Number : %v", pageNumber)
+		debug(fmt.Sprintf("Right Page Number : [%v] \n", h.rightPageNum))
 	}
 	return &h, nil
 
@@ -103,7 +112,22 @@ func (t ColumnSerialType) Type() ColumnType {
 		return Null
 	case t == 1:
 		return Int8
-	//Todo: add more cases
+	case t == 2:
+		return Int16
+	case t == 3:
+		return Int24
+	case t == 4:
+		return Int32
+	case t == 5:
+		return Int48
+	case t == 6:
+		return Int64
+	case t == 7:
+		return Float
+	case t == 8:
+		return ZeroInt
+	case t == 9:
+		return OneInt
 	case (t >= 12) && ((t % 2) == 0):
 		return Blob
 	case (t >= 13) && ((t % 2) == 1):
@@ -118,6 +142,20 @@ func (st ColumnSerialType) Size() int64 {
 	switch st.Type() {
 	case Int8:
 		return 1
+	case Int16:
+		return 2
+	case Int24:
+		return 3
+	case Int32:
+		return 4
+	case Int48:
+		return 6
+	case Int64:
+		return 8
+	case Float:
+		return 8
+	case ZeroInt, OneInt:
+		return 0
 	case Blob:
 		return int64((st - 12) / 2)
 	case StringVal:
@@ -154,23 +192,29 @@ func ReadColumn(ctyp *ColumnSerialType, r io.Reader) (*Column, error) {
 }
 
 func (c Column) StringVal() string {
+
+	//fmt.Printf("c.serialType: %v\n", c.serialType.Type())
 	ctype := c.serialType.Type()
+	if ctype == Null {
+		return ""
+	}
 	if ctype != StringVal {
-		log.Fatal("Column type is not string. It is %v instread.", ctype)
+		log.Fatalf("Column type is not string. It is %v instead.", ctype)
 	}
 	return string(c.bytes)
 }
 
-func (c Column) Int8Val() int {
+func (c Column) Int8Val() uint32 {
 	ctype := c.serialType.Type()
 	if ctype != Int8 {
-		log.Fatal("Column type is not string. It is %v instread.", ctype)
+		log.Fatalf("Column type is not Int8. It is %v instead.", ctype)
 	}
-	return int(c.bytes[0])
+	return uint32(c.bytes[0])
 }
 
 type Record struct {
 	columns []Column
+	rowId   int64
 }
 
 func ReadRecord(r io.Reader) (*Record, error) {
@@ -188,7 +232,6 @@ func ReadRecord(r io.Reader) (*Record, error) {
 	//fmt.Fprintf(os.Stderr, "record size : %v\n", rcdSize)
 	//fmt.Fprintf(os.Stderr, "row id : %v\n", rowId)
 	_ = rcdSize
-	_ = rowId
 
 	// Record Header
 	hdrSize, nbytes, err := ParseVarint(r)
@@ -205,10 +248,12 @@ func ReadRecord(r io.Reader) (*Record, error) {
 		if hBytesLeft <= 0 {
 			break
 		}
+		debug("Parsing Serial type ...")
 		stype, nb, err := ParseVarint(r)
 		if err != nil {
 			return nil, err
 		}
+		debug(fmt.Sprintf("Serial type [%d] nbytes = [%d]", stype, nbytes))
 		serialType := ColumnSerialType(stype)
 		collSerialTypes = append(collSerialTypes, serialType)
 		hBytesLeft -= int64(nb)
@@ -229,20 +274,21 @@ func ReadRecord(r io.Reader) (*Record, error) {
 
 	return &Record{
 		columns: columns,
+		rowId:   rowId,
 	}, nil
 
 }
 
-func ReadRecords(r io.ReadSeeker, numCells int16, rootPage int) (*[]Record, error) {
+func ReadLeafPageRecords(r io.ReadSeeker, numCells uint16, rootPage uint32) (*[]Record, error) {
 	// read cell pointer array
-	cellPointers := make([]int16, numCells)
+	cellPointers := make([]uint16, numCells)
 	recoreds := make([]Record, 0, numCells)
 	if err := binary.Read(r, binary.BigEndian, &cellPointers); err != nil {
 		fmt.Fprintln(os.Stderr, "error reading cell pointers", err)
 		return nil, err
 	}
 	for _, cp := range cellPointers {
-		JumpToPage(r, h.pageSize, rootPage, int(cp))
+		JumpToPage(r, h.pageSize, rootPage, cp)
 		record, err := ReadRecord(r)
 		if err != nil {
 			return nil, err
@@ -252,25 +298,106 @@ func ReadRecords(r io.ReadSeeker, numCells int16, rootPage int) (*[]Record, erro
 	return &recoreds, nil
 }
 
-func ReadPage(r io.ReadSeeker, rootPage int) (*[]Record, error) {
-	pHeader, err := ReadPageHeader(r, rootPage)
+func ReadPage(r io.ReadSeeker, pageNum uint32) (*[]Record, error) {
+
+	debug(fmt.Sprintf("Reading Page Number: <%d>\n", pageNum))
+
+	pHeader, err := ReadPageHeader(r, pageNum)
 	if err != nil {
 		log.Println("Failed to read file header: ", err)
 		return nil, err
 	}
-	records, err := ReadRecords(r, pHeader.numCell, rootPage)
-	if err != nil {
-		log.Println("Failed to read records: ", err)
+
+	// handle leaf page - Read all the records
+	if PageType(pHeader.pageType) == TableLeafPage {
+		debug("<<<<<Leaf Page>>>>")
+		records, err := ReadLeafPageRecords(r, pHeader.numCell, pageNum)
+		if err != nil {
+			log.Println("Failed to read records: ", err)
+			return nil, err
+		}
+		return records, nil
+	}
+
+	if PageType(pHeader.pageType) == TableInteriorPage {
+
+		debug(fmt.Sprintf("<<<<<Interior Page>>>> cells [%d]", pHeader.numCell))
+		records, err := TraverseInteriorPage(r, pHeader.numCell, pageNum, pHeader.rightPageNum)
+		if err != nil {
+			log.Println("Failed to read records: ", err)
+			return nil, err
+		}
+		return records, nil
+	}
+
+	return nil, fmt.Errorf("Read Page: Invalid page type : [%d]", pHeader.pageType)
+}
+
+func TraverseInteriorPage(r io.ReadSeeker, numCells uint16, pageNum uint32, rightPageNum uint32) (*[]Record, error) {
+
+	recs := make([]Record, 0)
+	// Read Cell Pointers
+	cellPointers := make([]uint16, numCells)
+	if err := binary.Read(r, binary.BigEndian, &cellPointers); err != nil {
+		fmt.Fprintln(os.Stderr, "error reading cell pointers", err)
 		return nil, err
 	}
-	return records, nil
+
+	childPages := make([]uint32, 0, numCells)
+
+	debug(fmt.Sprintf("numCells : [%d]\n", numCells))
+
+	for _, cp := range cellPointers {
+		JumpToPage(r, h.pageSize, pageNum, cp)
+		var childPageNum uint32
+		if err := binary.Read(r, binary.BigEndian, &childPageNum); err != nil {
+			fmt.Fprintln(os.Stderr, "error reading child Page Number", err)
+			return nil, err
+		}
+
+		_, _, err := ParseVarint(r)
+		if err != nil {
+			return nil, err
+		}
+		//debug(fmt.Sprintf("key: %v\n", key))
+		//if childPageNum == int32(pageNum) {
+		//	continue
+		//}
+
+		childPages = append(childPages, childPageNum)
+
+		// debug(fmt.Sprintf("Reading child page [%d] <--- of parent page [%d]", childPageNum, pageNum))
+
+	}
+	//	if pageNum == 50 {
+	//		fmt.Printf("page Size : [%d]\n", h.pageSize)
+	//		fmt.Printf("Parent page %d \n", pageNum)
+	//		fmt.Printf("FILE HEAD: (%d) [0x%X]\n", fileHeadLocation, fileHeadLocation)
+	//		childPages = append(childPages, rightPageNum)
+	//		fmt.Printf("Child Pages of len : %d \n", len(childPages))
+	//		for _, cpage := range childPages {
+	//			fmt.Printf(" *<%v> ", cpage)
+	//		}
+	//	}
+
+	for _, cpage := range childPages {
+		childRecs, err := ReadPage(r, cpage)
+		if err != nil {
+			return nil, err
+		}
+		recs = append(recs, *childRecs...)
+	}
+
+	debug("\n")
+
+	return &recs, nil
 }
 
 type SqlSchemaRecord struct {
 	Typ      string
 	Name     string
 	TablName string
-	RootPage int
+	RootPage uint32
 	Sql      string
 }
 
@@ -296,9 +423,11 @@ func ReadSqlSchema(r io.ReadSeeker) (*[]SqlSchemaRecord, error) {
 func parseDDL(ddlSql string) *sqlparser.DDL {
 
 	sql := strings.ReplaceAll(ddlSql, "autoincrement", "")
+	sql = strings.ReplaceAll(sql, "\"", "")
+
 	stmt, err := sqlparser.Parse(sql)
 	if err != nil {
-		log.Fatal("Error parsing SQL")
+		log.Fatalf("Error parsing SQL : {%s} \n Error : %s", sql, err.Error())
 	}
 
 	ddl, ok := stmt.(*sqlparser.DDL)
@@ -335,11 +464,17 @@ func fetchTableMetadata(r io.ReadSeeker, tableName string) (*SqlSchemaRecord, er
 	return nil, errors.New("Table not found")
 }
 
-func JumpToPage(seeker io.Seeker, pageSize uint16, page int, offset int) {
+var fileHeadLocation int64
+
+func JumpToPage(seeker io.Seeker, pageSize uint16, pageNum uint32, offset uint16) {
 	// jump to rootpage
-	_, err := seeker.Seek(int64(pageSize*uint16(page-1))+int64(offset), io.SeekStart)
+	fileHeadLocation = int64(uint32(pageSize)*(pageNum-1) + uint32(offset))
+	_, err := seeker.Seek(fileHeadLocation, io.SeekStart)
 	if err != nil {
 		log.Fatal(err)
+	}
+	if pageNum == 50 {
+		debug(fmt.Sprintf("Jumped tp <%d - 1> * (%d) + [%d] = %d", pageNum, pageSize, offset, fileHeadLocation))
 	}
 }
 
@@ -360,6 +495,10 @@ func ParseWhereClause(selectStmt *sqlparser.Select) *WhereClause {
 		}
 	}
 	return nil
+}
+
+func debug(msg string) {
+	//fmt.Fprintf(os.Stderr, "DEBUG: %s\n", msg)
 }
 
 var h *Header
@@ -429,6 +568,8 @@ func main() {
 
 			ddlSql := tblMetaData.Sql
 			ddlStmt := parseDDL(ddlSql)
+			debug("DDL parsed")
+			debug(ddlSql)
 
 			where := ParseWhereClause(selectStmt)
 
@@ -444,6 +585,11 @@ func main() {
 
 			for i, col := range ddlStmt.TableSpec.Columns {
 				colName := col.Name.String()
+				debug(fmt.Sprintf("column %s (%s) [?pk => %v]\n", col.Name.String(), col.Type.Type, (col.Type.KeyOpt == 1)))
+				if strings.ToUpper(col.Type.Type) == "INTEGER" && col.Type.KeyOpt == 1 {
+					collIndexMap[colName] = -1 // index for row id
+					continue
+				}
 				collIndexMap[colName] = i
 			}
 
@@ -456,6 +602,7 @@ func main() {
 			}
 
 			rootPage := tblMetaData.RootPage
+			debug(fmt.Sprintf("Raeding B-Tree root page: <%d>", rootPage))
 			recs, err := ReadPage(databaseFile, rootPage)
 			if err != nil {
 				log.Fatal("Error reading page", err)
@@ -472,7 +619,14 @@ func main() {
 				}
 				colVals := make([]string, 0, len(selectCollIndices))
 				for _, colIndex := range selectCollIndices {
-					colVals = append(colVals, rec.columns[colIndex].StringVal())
+					//debug(fmt.Sprintf("Colun type %x", *rec.columns[colIndex].serialType))
+					var colVal string
+					if colIndex == -1 {
+						colVal = fmt.Sprintf("%d", rec.rowId)
+					} else {
+						colVal = rec.columns[colIndex].StringVal()
+					}
+					colVals = append(colVals, colVal)
 				}
 				fmt.Println(strings.Join(colVals, "|"))
 			}
