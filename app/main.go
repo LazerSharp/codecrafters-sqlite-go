@@ -46,7 +46,7 @@ const (
 type PageHeader struct {
 	numCell      uint16
 	rightPageNum uint32 // pointer
-	pageType     byte
+	pageType     PageType
 }
 
 func ReadPageHeader(r io.ReadSeeker, page uint32) (*PageHeader, error) {
@@ -70,10 +70,10 @@ func ReadPageHeader(r io.ReadSeeker, page uint32) (*PageHeader, error) {
 	}
 
 	// b-tree page type
-	h.pageType = (pageHeader[0])
+	h.pageType = PageType(pageHeader[0])
 
 	//fmt.Fprintf(os.Stderr, "Page type: %v\n", h.pageType)
-	if PageType(h.pageType) == TableInteriorPage || PageType(h.pageType) == IndexInteriorPage { // interior page
+	if h.pageType == TableInteriorPage || h.pageType == IndexInteriorPage { // interior page
 		if err := binary.Read(r, binary.BigEndian, &h.rightPageNum); err != nil {
 			fmt.Println("Failed to read integer:", err)
 			return nil, err
@@ -204,12 +204,16 @@ func (c Column) StringVal() string {
 	return string(c.bytes)
 }
 
-func (c Column) Int8Val() uint32 {
+func (c Column) IntVal() int64 {
 	ctype := c.serialType.Type()
-	if ctype != Int8 {
-		log.Fatalf("Column type is not Int8. It is %v instead.", ctype)
+	if !(ctype == Int8 || ctype == Int16 || ctype == Int24 || ctype == Int32) {
+		log.Fatalf("Column type is not Int8 / Int 16 / Int32. It is %v instead.", ctype)
 	}
-	return uint32(c.bytes[0])
+	n, err := IntFromBytes(c.bytes)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return n
 }
 
 type Record struct {
@@ -233,6 +237,18 @@ func ReadRecord(r io.Reader) (*Record, error) {
 	//fmt.Fprintf(os.Stderr, "row id : %v\n", rowId)
 	_ = rcdSize
 
+	columns, err := readPayload(r)
+	if err != nil {
+		return nil, err
+	}
+	return &Record{
+		columns: *columns,
+		rowId:   rowId,
+	}, nil
+
+}
+
+func readPayload(r io.Reader) (*[]Column, error) {
 	// Record Header
 	hdrSize, nbytes, err := ParseVarint(r)
 	if err != nil {
@@ -241,6 +257,7 @@ func ReadRecord(r io.Reader) (*Record, error) {
 	//fmt.Printf("Size of header %v, bytes in hdrSize %v \n", hdrSize, nbytes)
 	// Parse Seial types of columns
 	hBytesLeft := hdrSize - int64(nbytes)
+	debug(fmt.Sprintf("Bytes for columns: %d", hBytesLeft))
 
 	collSerialTypes := make([]ColumnSerialType, 0)
 
@@ -264,6 +281,8 @@ func ReadRecord(r io.Reader) (*Record, error) {
 
 	columns := make([]Column, 0, len(collSerialTypes))
 
+	debug(fmt.Sprintf("No of columns: %d", len(collSerialTypes)))
+
 	for _, collSerialType := range collSerialTypes {
 		column, err := ReadColumn(&collSerialType, r)
 		if err != nil {
@@ -271,11 +290,32 @@ func ReadRecord(r io.Reader) (*Record, error) {
 		}
 		columns = append(columns, *column)
 	}
+	return &columns, nil
+}
 
-	return &Record{
-		columns: columns,
-		rowId:   rowId,
-	}, nil
+func ReadIndexRecord(r io.ReadSeeker, isInterior bool) (*IndexRecord, error) {
+
+	var leftPageNum uint32
+	if isInterior {
+		err := binary.Read(r, binary.BigEndian, &leftPageNum)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	rcdSize, _, err := ParseVarint(r)
+	if err != nil {
+		return nil, err
+	}
+	_ = rcdSize // ignore record size
+
+	cols, err := readPayload(r)
+	if err != nil {
+		return nil, err
+	}
+
+	log.Fatal("#columns in payload: ", len(*cols))
+	return nil, nil
 
 }
 
@@ -298,7 +338,7 @@ func ReadLeafPageRecords(r io.ReadSeeker, numCells uint16, rootPage uint32) (*[]
 	return &recoreds, nil
 }
 
-func ReadPage(r io.ReadSeeker, pageNum uint32) (*[]Record, error) {
+func ReadTablePage(r io.ReadSeeker, pageNum uint32) (*[]Record, error) {
 
 	debug(fmt.Sprintf("Reading Page Number: <%d>\n", pageNum))
 
@@ -309,7 +349,7 @@ func ReadPage(r io.ReadSeeker, pageNum uint32) (*[]Record, error) {
 	}
 
 	// handle leaf page - Read all the records
-	if PageType(pHeader.pageType) == TableLeafPage {
+	if pHeader.pageType == TableLeafPage {
 		debug("<<<<<Leaf Page>>>>")
 		records, err := ReadLeafPageRecords(r, pHeader.numCell, pageNum)
 		if err != nil {
@@ -319,7 +359,7 @@ func ReadPage(r io.ReadSeeker, pageNum uint32) (*[]Record, error) {
 		return records, nil
 	}
 
-	if PageType(pHeader.pageType) == TableInteriorPage {
+	if pHeader.pageType == TableInteriorPage {
 
 		debug(fmt.Sprintf("<<<<<Interior Page>>>> cells [%d]", pHeader.numCell))
 		records, err := TraverseInteriorPage(r, pHeader.numCell, pageNum, pHeader.rightPageNum)
@@ -329,8 +369,61 @@ func ReadPage(r io.ReadSeeker, pageNum uint32) (*[]Record, error) {
 		}
 		return records, nil
 	}
-
 	return nil, fmt.Errorf("Read Page: Invalid page type : [%d]", pHeader.pageType)
+}
+
+func ReadIndexPage(r io.ReadSeeker, pageNum uint32) (*[]int, error) {
+
+	debug(fmt.Sprintf("Reading Page Number: <%d>\n", pageNum))
+
+	pHeader, err := ReadPageHeader(r, pageNum)
+	if err != nil {
+		log.Println("Failed to read file header: ", err)
+		return nil, err
+	}
+
+	if pHeader.pageType == IndexLeafPage {
+		debug(fmt.Sprintf("Page# %d is an index-leaf page", pageNum))
+		return ReadIndexLeafPage(r, pHeader.numCell, pageNum)
+	}
+
+	if pHeader.pageType == IndexInteriorPage {
+		debug(fmt.Sprintf("Page# %d is an index-interior page", pageNum))
+		return TraverseIndexInteriorPage(r, pHeader.numCell, pageNum, pHeader.rightPageNum)
+	}
+	return nil, fmt.Errorf("Read Index Page: Invalid page type : [%d]", pHeader.pageType)
+}
+
+type IndexRecord struct {
+}
+
+func ReadIndexPageBody(r io.ReadSeeker, numCells uint16, pageNum uint32, isLeaf bool) (*[]int, error) {
+	// read cell pointer array
+	cellPointers := make([]uint16, numCells)
+	recoreds := make([]IndexRecord, 0, numCells)
+	if err := binary.Read(r, binary.BigEndian, &cellPointers); err != nil {
+		fmt.Fprintln(os.Stderr, "error reading cell pointers", err)
+		return nil, err
+	}
+	debug(fmt.Sprintf("# of cells: %d", numCells))
+	for _, cp := range cellPointers {
+		JumpToPage(r, h.pageSize, pageNum, cp)
+		record, err := ReadIndexRecord(r, isLeaf)
+		if err != nil {
+			return nil, err
+		}
+		recoreds = append(recoreds, *record)
+	}
+	return nil, nil
+
+}
+
+func ReadIndexLeafPage(r io.ReadSeeker, numCell uint16, pageNum uint32) (*[]int, error) {
+	return ReadIndexPageBody(r, numCell, pageNum, true)
+}
+
+func TraverseIndexInteriorPage(r io.ReadSeeker, numCell uint16, pageNum, rightPageNum uint32) (*[]int, error) {
+	return ReadIndexPageBody(r, numCell, pageNum, false)
 }
 
 func TraverseInteriorPage(r io.ReadSeeker, numCells uint16, pageNum uint32, rightPageNum uint32) (*[]Record, error) {
@@ -381,7 +474,7 @@ func TraverseInteriorPage(r io.ReadSeeker, numCells uint16, pageNum uint32, righ
 	//	}
 
 	for _, cpage := range childPages {
-		childRecs, err := ReadPage(r, cpage)
+		childRecs, err := ReadTablePage(r, cpage)
 		if err != nil {
 			return nil, err
 		}
@@ -403,7 +496,7 @@ type SqlSchemaRecord struct {
 
 func ReadSqlSchema(r io.ReadSeeker) (*[]SqlSchemaRecord, error) {
 	// Assuming the head on page 1 and file header (initial 100 bytes) already consumed / skipped
-	records, _ := ReadPage(r, 1)
+	records, _ := ReadTablePage(r, 1)
 	schemaRecods := make([]SqlSchemaRecord, 0, len(*records))
 
 	for _, rec := range *records {
@@ -411,7 +504,7 @@ func ReadSqlSchema(r io.ReadSeeker) (*[]SqlSchemaRecord, error) {
 			Typ:      rec.columns[0].StringVal(),
 			Name:     rec.columns[1].StringVal(),
 			TablName: rec.columns[2].StringVal(),
-			RootPage: rec.columns[3].Int8Val(),
+			RootPage: uint32(rec.columns[3].IntVal()),
 			Sql:      rec.columns[4].StringVal(),
 		}
 		schemaRecods = append(schemaRecods, schemaRecord)
@@ -423,11 +516,12 @@ func ReadSqlSchema(r io.ReadSeeker) (*[]SqlSchemaRecord, error) {
 func parseDDL(ddlSql string) *sqlparser.DDL {
 
 	sql := strings.ReplaceAll(ddlSql, "autoincrement", "")
+	sql = strings.ReplaceAll(sql, "\"size range\"", "size_range")
 	sql = strings.ReplaceAll(sql, "\"", "")
 
-	stmt, err := sqlparser.Parse(sql)
+	stmt, err := sqlparser.ParseStrictDDL(sql)
 	if err != nil {
-		log.Fatalf("Error parsing SQL : {%s} \n Error : %s", sql, err.Error())
+		log.Fatalf("Error parsing DDL : {%s} \n Error : %s", sql, err.Error())
 	}
 
 	ddl, ok := stmt.(*sqlparser.DDL)
@@ -451,13 +545,9 @@ func parseSelectQuery(selectSql string) *sqlparser.Select {
 	return selectStmt
 }
 
-func fetchTableMetadata(r io.ReadSeeker, tableName string) (*SqlSchemaRecord, error) {
-	recs, err := ReadSqlSchema(r)
-	if err != nil {
-		return nil, err
-	}
+func fetchDBItemMetaData(recs *[]SqlSchemaRecord, name string) (*SqlSchemaRecord, error) {
 	for _, rec := range *recs {
-		if rec.TablName == tableName {
+		if rec.Name == name {
 			return &rec, nil
 		}
 	}
@@ -497,8 +587,63 @@ func ParseWhereClause(selectStmt *sqlparser.Select) *WhereClause {
 	return nil
 }
 
+func ColumnIndices(ddlStmt *sqlparser.DDL, selectStmt *sqlparser.Select, where *WhereClause) (selectCollIndices []int, whereCollIndex int) {
+
+	selectColumns := make([]string, 0, len(selectStmt.SelectExprs))
+	for _, expr := range selectStmt.SelectExprs {
+		selectColumns = append(selectColumns, sqlparser.String(expr))
+	}
+
+	selectCollIndices = make([]int, 0, len(ddlStmt.TableSpec.Columns))
+	whereCollIndex = -1
+
+	collIndexMap := map[string]int{}
+
+	for i, col := range ddlStmt.TableSpec.Columns {
+		colName := col.Name.String()
+		debug(fmt.Sprintf("column %s (%s) [?pk => %v]\n", col.Name.String(), col.Type.Type, (col.Type.KeyOpt == 1)))
+		if strings.ToUpper(col.Type.Type) == "INTEGER" && col.Type.KeyOpt == 1 {
+			collIndexMap[colName] = -1 // index for row id
+			continue
+		}
+		collIndexMap[colName] = i
+	}
+
+	for _, scoll := range selectColumns {
+		selectCollIndices = append(selectCollIndices, collIndexMap[scoll])
+	}
+
+	if where != nil {
+		whereCollIndex = collIndexMap[where.Collumn]
+	}
+	return selectCollIndices, whereCollIndex
+}
+
+func PrintResult(records *[]Record, selectColumnIndices []int, whereColumnIndex int, where *WhereClause) {
+	for _, rec := range *records {
+		if where != nil {
+			if rec.columns[whereColumnIndex].StringVal() != where.Value {
+				// skip it!
+				continue
+			}
+		}
+		colVals := make([]string, 0, len(selectColumnIndices))
+		for _, colIndex := range selectColumnIndices {
+			//debug(fmt.Sprintf("Colun type %x", *rec.columns[colIndex].serialType))
+			var colVal string
+			if colIndex == -1 {
+				colVal = fmt.Sprintf("%d", rec.rowId)
+			} else {
+				colVal = rec.columns[colIndex].StringVal()
+			}
+			colVals = append(colVals, colVal)
+		}
+		fmt.Println(strings.Join(colVals, "|"))
+	}
+}
+
 func debug(msg string) {
-	//fmt.Fprintf(os.Stderr, "DEBUG: %s\n", msg)
+	// fmt.Fprintf(os.Stderr, "DEBUG: %s\n", msg)
 }
 
 var h *Header
@@ -540,6 +685,10 @@ func main() {
 
 	default:
 
+		metaRecords, err := ReadSqlSchema(databaseFile)
+		if err != nil {
+			log.Fatal(err.Error())
+		}
 		// read select Query
 
 		selectQuery := command
@@ -548,7 +697,7 @@ func main() {
 		tblName := sqlparser.String(selectStmt.From)
 		selectColumn := sqlparser.String(selectStmt.SelectExprs)
 
-		tblMetaData, err := fetchTableMetadata(databaseFile, tblName)
+		tblMetaData, err := fetchDBItemMetaData(metaRecords, tblName)
 
 		if err != nil {
 			log.Fatal("Error fetching meta data", err)
@@ -570,66 +719,35 @@ func main() {
 			ddlStmt := parseDDL(ddlSql)
 			debug("DDL parsed")
 			debug(ddlSql)
-
 			where := ParseWhereClause(selectStmt)
 
-			selectColumns := make([]string, 0, len(selectStmt.SelectExprs))
-			for _, expr := range selectStmt.SelectExprs {
-				selectColumns = append(selectColumns, sqlparser.String(expr))
-			}
+			selectCollIndices, whereCollIndex := ColumnIndices(ddlStmt, selectStmt, where)
 
-			selectCollIndices := make([]int, 0, len(ddlStmt.TableSpec.Columns))
-			whereCollIndex := -1
+			// Use index?
 
-			collIndexMap := map[string]int{}
+			if tblName == "companies" {
+				idx, _ := fetchDBItemMetaData(metaRecords, "idx_companies_country")
 
-			for i, col := range ddlStmt.TableSpec.Columns {
-				colName := col.Name.String()
-				debug(fmt.Sprintf("column %s (%s) [?pk => %v]\n", col.Name.String(), col.Type.Type, (col.Type.KeyOpt == 1)))
-				if strings.ToUpper(col.Type.Type) == "INTEGER" && col.Type.KeyOpt == 1 {
-					collIndexMap[colName] = -1 // index for row id
-					continue
+				rowIds, err := ReadIndexPage(databaseFile, idx.RootPage)
+
+				if err != nil {
+					log.Fatal("Error reading Index page", err)
 				}
-				collIndexMap[colName] = i
+				fmt.Printf("rowIds: %v\n", rowIds)
+				os.Exit(0)
 			}
 
-			for _, scoll := range selectColumns {
-				selectCollIndices = append(selectCollIndices, collIndexMap[scoll])
-			}
-
-			if where != nil {
-				whereCollIndex = collIndexMap[where.Collumn]
-			}
+			// Read data from Table B-Tree
 
 			rootPage := tblMetaData.RootPage
 			debug(fmt.Sprintf("Raeding B-Tree root page: <%d>", rootPage))
-			recs, err := ReadPage(databaseFile, rootPage)
+			recs, err := ReadTablePage(databaseFile, rootPage)
 			if err != nil {
 				log.Fatal("Error reading page", err)
 			}
 
-			//fmt.Printf("whereCollIndex: %v\n", whereCollIndex)
+			PrintResult(recs, selectCollIndices, whereCollIndex, where)
 
-			for _, rec := range *recs {
-				if where != nil {
-					if rec.columns[whereCollIndex].StringVal() != where.Value {
-						// skip it!
-						continue
-					}
-				}
-				colVals := make([]string, 0, len(selectCollIndices))
-				for _, colIndex := range selectCollIndices {
-					//debug(fmt.Sprintf("Colun type %x", *rec.columns[colIndex].serialType))
-					var colVal string
-					if colIndex == -1 {
-						colVal = fmt.Sprintf("%d", rec.rowId)
-					} else {
-						colVal = rec.columns[colIndex].StringVal()
-					}
-					colVals = append(colVals, colVal)
-				}
-				fmt.Println(strings.Join(colVals, "|"))
-			}
 		}
 	}
 }

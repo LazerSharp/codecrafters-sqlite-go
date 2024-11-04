@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 )
@@ -21,4 +22,19 @@ func ParseVarint(r io.Reader) (ret int64, nbytes int8, err error) {
 		ret = ret << 7
 	}
 	return ret, nbytes, nil
+}
+
+func IntFromBytes(bytes []byte) (ret int64, err error) {
+	l := len(bytes)
+	if l == 0 {
+		return 0, nil
+	}
+	if l > 8 {
+		return -1, errors.New("More than 8 bytes of data not allowed")
+	}
+	for _, b := range bytes {
+		ret = ret << 8
+		ret = ret | int64(b)
+	}
+	return ret, nil
 }
