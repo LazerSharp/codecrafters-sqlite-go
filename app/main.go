@@ -293,8 +293,13 @@ func readPayload(r io.Reader) (*[]Column, error) {
 	return &columns, nil
 }
 
-func ReadIndexRecord(r io.ReadSeeker, isInterior bool) (*IndexRecord, error) {
+type IndexRecord struct {
+	leftPageNum uint32
+	rowId       int64
+	key         string
+}
 
+func ReadIndexRecord(r io.ReadSeeker, isInterior bool) (*IndexRecord, error) {
 	var leftPageNum uint32
 	if isInterior {
 		err := binary.Read(r, binary.BigEndian, &leftPageNum)
@@ -302,21 +307,22 @@ func ReadIndexRecord(r io.ReadSeeker, isInterior bool) (*IndexRecord, error) {
 			return nil, err
 		}
 	}
-
 	rcdSize, _, err := ParseVarint(r)
 	if err != nil {
 		return nil, err
 	}
 	_ = rcdSize // ignore record size
-
 	cols, err := readPayload(r)
 	if err != nil {
 		return nil, err
 	}
-
-	log.Fatal("#columns in payload: ", len(*cols))
-	return nil, nil
-
+	ir := IndexRecord{
+		leftPageNum: leftPageNum,
+		key:         (*cols)[0].StringVal(),
+		rowId:       (*cols)[1].IntVal(),
+	}
+	debug(fmt.Sprintf("[%s] => #%d", ir.key, ir.rowId))
+	return &ir, nil
 }
 
 func ReadLeafPageRecords(r io.ReadSeeker, numCells uint16, rootPage uint32) (*[]Record, error) {
@@ -372,7 +378,7 @@ func ReadTablePage(r io.ReadSeeker, pageNum uint32) (*[]Record, error) {
 	return nil, fmt.Errorf("Read Page: Invalid page type : [%d]", pHeader.pageType)
 }
 
-func ReadIndexPage(r io.ReadSeeker, pageNum uint32) (*[]int, error) {
+func ReadIndexPage(r io.ReadSeeker, pageNum uint32, key string) (*[]int, error) {
 
 	debug(fmt.Sprintf("Reading Page Number: <%d>\n", pageNum))
 
@@ -384,46 +390,69 @@ func ReadIndexPage(r io.ReadSeeker, pageNum uint32) (*[]int, error) {
 
 	if pHeader.pageType == IndexLeafPage {
 		debug(fmt.Sprintf("Page# %d is an index-leaf page", pageNum))
-		return ReadIndexLeafPage(r, pHeader.numCell, pageNum)
+		return ReadIndexLeafPage(r, pHeader.numCell, pageNum, key)
 	}
 
 	if pHeader.pageType == IndexInteriorPage {
 		debug(fmt.Sprintf("Page# %d is an index-interior page", pageNum))
-		return TraverseIndexInteriorPage(r, pHeader.numCell, pageNum, pHeader.rightPageNum)
+		return TraverseIndexInteriorPage(r, pHeader.numCell, pageNum, pHeader.rightPageNum, key)
 	}
 	return nil, fmt.Errorf("Read Index Page: Invalid page type : [%d]", pHeader.pageType)
 }
 
-type IndexRecord struct {
-}
+func ReadIndexPageBody(r io.ReadSeeker, numCells uint16, pageNum uint32, key string, rightPageNum uint32, isInterior bool) (*[]int, error) {
 
-func ReadIndexPageBody(r io.ReadSeeker, numCells uint16, pageNum uint32, isLeaf bool) (*[]int, error) {
 	// read cell pointer array
 	cellPointers := make([]uint16, numCells)
-	recoreds := make([]IndexRecord, 0, numCells)
+	//recoreds := make([]IndexRecord, 0, numCells)
 	if err := binary.Read(r, binary.BigEndian, &cellPointers); err != nil {
 		fmt.Fprintln(os.Stderr, "error reading cell pointers", err)
 		return nil, err
 	}
 	debug(fmt.Sprintf("# of cells: %d", numCells))
+
+	rowIds := make([]int, 0)
 	for _, cp := range cellPointers {
 		JumpToPage(r, h.pageSize, pageNum, cp)
-		record, err := ReadIndexRecord(r, isLeaf)
+		record, err := ReadIndexRecord(r, isInterior)
 		if err != nil {
 			return nil, err
 		}
-		recoreds = append(recoreds, *record)
+		cmp := strings.Compare(key, record.key)
+
+		if cmp == 0 {
+			rowIds = append(rowIds, int(record.rowId))
+		}
+		//recoreds = append(recoreds, *record)
+		if cmp < 0 {
+			if isInterior {
+				// follow left
+				crowIds, err := ReadIndexPage(r, record.leftPageNum, key)
+				if err != nil {
+					return nil, err
+				}
+				rowIds = append(rowIds, *crowIds...)
+				return &rowIds, nil
+			} else { // leaf Node
+				return &rowIds, nil
+			}
+		}
 	}
-	return nil, nil
+
+	if isInterior {
+		return ReadIndexPage(r, rightPageNum, key)
+	} else {
+		return &rowIds, nil
+	}
 
 }
 
-func ReadIndexLeafPage(r io.ReadSeeker, numCell uint16, pageNum uint32) (*[]int, error) {
-	return ReadIndexPageBody(r, numCell, pageNum, true)
+func ReadIndexLeafPage(r io.ReadSeeker, numCell uint16, pageNum uint32, key string) (*[]int, error) {
+	return ReadIndexPageBody(r, numCell, pageNum, key, 0, false)
 }
 
-func TraverseIndexInteriorPage(r io.ReadSeeker, numCell uint16, pageNum, rightPageNum uint32) (*[]int, error) {
-	return ReadIndexPageBody(r, numCell, pageNum, false)
+func TraverseIndexInteriorPage(r io.ReadSeeker, numCell uint16, pageNum, rightPageNum uint32, key string) (*[]int, error) {
+	return ReadIndexPageBody(r, numCell, pageNum, key, rightPageNum, true)
 }
 
 func TraverseInteriorPage(r io.ReadSeeker, numCells uint16, pageNum uint32, rightPageNum uint32) (*[]Record, error) {
@@ -728,26 +757,25 @@ func main() {
 			if tblName == "companies" {
 				idx, _ := fetchDBItemMetaData(metaRecords, "idx_companies_country")
 
-				rowIds, err := ReadIndexPage(databaseFile, idx.RootPage)
+				rowIds, err := ReadIndexPage(databaseFile, idx.RootPage, where.Value)
 
 				if err != nil {
 					log.Fatal("Error reading Index page", err)
 				}
-				fmt.Printf("rowIds: %v\n", rowIds)
+				for _, rowId := range *rowIds {
+					fmt.Printf("rowId: %v\n", rowId)
+				}
 				os.Exit(0)
 			}
 
 			// Read data from Table B-Tree
-
 			rootPage := tblMetaData.RootPage
 			debug(fmt.Sprintf("Raeding B-Tree root page: <%d>", rootPage))
 			recs, err := ReadTablePage(databaseFile, rootPage)
 			if err != nil {
 				log.Fatal("Error reading page", err)
 			}
-
 			PrintResult(recs, selectCollIndices, whereCollIndex, where)
-
 		}
 	}
 }

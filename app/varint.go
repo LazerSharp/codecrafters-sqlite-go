@@ -2,7 +2,6 @@ package main
 
 import (
 	"errors"
-	"fmt"
 	"io"
 )
 
@@ -13,7 +12,7 @@ func ParseVarint(r io.Reader) (ret int64, nbytes int8, err error) {
 		if err != nil {
 			return 0, nbytes, err
 		}
-		debug(fmt.Sprintf("Varint Raw Byte %b", b[0]))
+		//debug(fmt.Sprintf("Varint Raw Byte %b", b[0]))
 		nbytes++
 		ret = ret | (int64(b[0] & 0x7F))
 		if b[0]&0x80 == 0 {
