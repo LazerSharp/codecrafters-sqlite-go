@@ -37,3 +37,33 @@ func IntFromBytes(bytes []byte) (ret int64, err error) {
 	}
 	return ret, nil
 }
+
+type Q struct {
+	data []int
+}
+
+func NewQ(ints []int) *Q {
+	return &Q{
+		data: ints,
+	}
+}
+
+func (q *Q) IsEmpty() bool {
+	return len(q.data) == 0
+}
+
+func (q *Q) Top() (int, bool) {
+	if q.IsEmpty() {
+		return 0, false
+	}
+	return q.data[0], true
+}
+
+func (q *Q) Pop() (int, bool) {
+	ret, ok := q.Top()
+	if !ok {
+		return 0, ok
+	}
+	q.data = q.data[1:]
+	return ret, ok
+}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"testing"
 )
 
@@ -44,4 +45,31 @@ func TestIntFromBytes(t *testing.T) {
 			t.Errorf("Actual: %v Expected: %v", i, expected)
 		}
 	}
+}
+
+func TestQ(t *testing.T) {
+
+	q := NewQ([]int{1, 2, 3})
+
+	fmt.Println(q.data)
+
+	if x, _ := q.Top(); x != 1 {
+		t.Error("Top should be 1 found: ", x)
+	}
+
+	if x, ok := q.Pop(); x != 1 || !ok {
+		t.Error("Pop should return 1")
+	}
+
+	if x, ok := q.Top(); x != 2 || !ok {
+		t.Error("Top should be 2")
+	}
+
+	q.Pop()
+	q.Pop()
+
+	if !q.IsEmpty() {
+		t.Error("'q' should be emplty!")
+	}
+
 }

@@ -325,7 +325,7 @@ func ReadIndexRecord(r io.ReadSeeker, isInterior bool) (*IndexRecord, error) {
 	return &ir, nil
 }
 
-func ReadLeafPageRecords(r io.ReadSeeker, numCells uint16, rootPage uint32) (*[]Record, error) {
+func ReadLeafPageRecords(r io.ReadSeeker, numCells uint16, rootPage uint32, rowIds *Q) (*[]Record, error) {
 	// read cell pointer array
 	cellPointers := make([]uint16, numCells)
 	recoreds := make([]Record, 0, numCells)
@@ -339,12 +339,23 @@ func ReadLeafPageRecords(r io.ReadSeeker, numCells uint16, rootPage uint32) (*[]
 		if err != nil {
 			return nil, err
 		}
+		if rowIds != nil {
+			if rowIds.IsEmpty() { // no more row ids to be searched
+				break
+			}
+			rowId, _ := rowIds.Top()
+			if record.rowId != int64(rowId) { // row id does not match - Skip!
+				continue
+			} else {
+				rowIds.Pop()
+			}
+		}
 		recoreds = append(recoreds, *record)
 	}
 	return &recoreds, nil
 }
 
-func ReadTablePage(r io.ReadSeeker, pageNum uint32) (*[]Record, error) {
+func ReadTablePage(r io.ReadSeeker, pageNum uint32, rowIds *Q) (*[]Record, error) {
 
 	debug(fmt.Sprintf("Reading Page Number: <%d>\n", pageNum))
 
@@ -357,7 +368,7 @@ func ReadTablePage(r io.ReadSeeker, pageNum uint32) (*[]Record, error) {
 	// handle leaf page - Read all the records
 	if pHeader.pageType == TableLeafPage {
 		debug("<<<<<Leaf Page>>>>")
-		records, err := ReadLeafPageRecords(r, pHeader.numCell, pageNum)
+		records, err := ReadLeafPageRecords(r, pHeader.numCell, pageNum, rowIds)
 		if err != nil {
 			log.Println("Failed to read records: ", err)
 			return nil, err
@@ -368,7 +379,7 @@ func ReadTablePage(r io.ReadSeeker, pageNum uint32) (*[]Record, error) {
 	if pHeader.pageType == TableInteriorPage {
 
 		debug(fmt.Sprintf("<<<<<Interior Page>>>> cells [%d]", pHeader.numCell))
-		records, err := TraverseInteriorPage(r, pHeader.numCell, pageNum, pHeader.rightPageNum)
+		records, err := TraverseInteriorPage(r, pHeader.numCell, pageNum, pHeader.rightPageNum, rowIds)
 		if err != nil {
 			log.Println("Failed to read records: ", err)
 			return nil, err
@@ -455,7 +466,7 @@ func TraverseIndexInteriorPage(r io.ReadSeeker, numCell uint16, pageNum, rightPa
 	return ReadIndexPageBody(r, numCell, pageNum, key, rightPageNum, true)
 }
 
-func TraverseInteriorPage(r io.ReadSeeker, numCells uint16, pageNum uint32, rightPageNum uint32) (*[]Record, error) {
+func TraverseInteriorPage(r io.ReadSeeker, numCells uint16, pageNum uint32, rightPageNum uint32, rowIds *Q) (*[]Record, error) {
 
 	recs := make([]Record, 0)
 	// Read Cell Pointers
@@ -465,10 +476,11 @@ func TraverseInteriorPage(r io.ReadSeeker, numCells uint16, pageNum uint32, righ
 		return nil, err
 	}
 
-	childPages := make([]uint32, 0, numCells)
+	//childPages := make([]uint32, 0, numCells)
 
 	debug(fmt.Sprintf("numCells : [%d]\n", numCells))
 
+	var rowId int64
 	for _, cp := range cellPointers {
 		JumpToPage(r, h.pageSize, pageNum, cp)
 		var childPageNum uint32
@@ -476,39 +488,44 @@ func TraverseInteriorPage(r io.ReadSeeker, numCells uint16, pageNum uint32, righ
 			fmt.Fprintln(os.Stderr, "error reading child Page Number", err)
 			return nil, err
 		}
-
-		_, _, err := ParseVarint(r)
+		var err error
+		rowId, _, err = ParseVarint(r)
 		if err != nil {
 			return nil, err
 		}
-		//debug(fmt.Sprintf("key: %v\n", key))
-		//if childPageNum == int32(pageNum) {
-		//	continue
-		//}
 
-		childPages = append(childPages, childPageNum)
+		if rowIds != nil {
+			if rowIds.IsEmpty() {
+				break
+			}
+			srowId, _ := rowIds.Top()
+			if rowId < int64(srowId) {
+				continue
+			}
+		}
 
-		// debug(fmt.Sprintf("Reading child page [%d] <--- of parent page [%d]", childPageNum, pageNum))
-
-	}
-	//	if pageNum == 50 {
-	//		fmt.Printf("page Size : [%d]\n", h.pageSize)
-	//		fmt.Printf("Parent page %d \n", pageNum)
-	//		fmt.Printf("FILE HEAD: (%d) [0x%X]\n", fileHeadLocation, fileHeadLocation)
-	//		childPages = append(childPages, rightPageNum)
-	//		fmt.Printf("Child Pages of len : %d \n", len(childPages))
-	//		for _, cpage := range childPages {
-	//			fmt.Printf(" *<%v> ", cpage)
-	//		}
-	//	}
-
-	for _, cpage := range childPages {
-		childRecs, err := ReadTablePage(r, cpage)
+		childRecs, err := ReadTablePage(r, childPageNum, rowIds)
 		if err != nil {
 			return nil, err
 		}
 		recs = append(recs, *childRecs...)
 	}
+
+	if rowIds != nil {
+		if rowIds.IsEmpty() {
+			return &recs, nil
+		}
+		srowId, _ := rowIds.Top()
+		if rowId < int64(srowId) {
+			return &recs, nil
+		}
+	}
+
+	cRecs, err := ReadTablePage(r, rightPageNum, rowIds)
+	if err != nil {
+		return nil, err
+	}
+	recs = append(recs, *cRecs...)
 
 	debug("\n")
 
@@ -525,7 +542,7 @@ type SqlSchemaRecord struct {
 
 func ReadSqlSchema(r io.ReadSeeker) (*[]SqlSchemaRecord, error) {
 	// Assuming the head on page 1 and file header (initial 100 bytes) already consumed / skipped
-	records, _ := ReadTablePage(r, 1)
+	records, _ := ReadTablePage(r, 1, nil)
 	schemaRecods := make([]SqlSchemaRecord, 0, len(*records))
 
 	for _, rec := range *records {
@@ -754,6 +771,7 @@ func main() {
 
 			// Use index?
 
+			var rowIdentifiers *Q = nil
 			if tblName == "companies" {
 				idx, _ := fetchDBItemMetaData(metaRecords, "idx_companies_country")
 
@@ -763,15 +781,17 @@ func main() {
 					log.Fatal("Error reading Index page", err)
 				}
 				for _, rowId := range *rowIds {
-					fmt.Printf("rowId: %v\n", rowId)
+					fmt.Println(fmt.Sprintf("rowId: %v", rowId))
 				}
-				os.Exit(0)
+
+				rowIdentifiers = NewQ(*rowIds)
+
 			}
 
 			// Read data from Table B-Tree
 			rootPage := tblMetaData.RootPage
 			debug(fmt.Sprintf("Raeding B-Tree root page: <%d>", rootPage))
-			recs, err := ReadTablePage(databaseFile, rootPage)
+			recs, err := ReadTablePage(databaseFile, rootPage, rowIdentifiers)
 			if err != nil {
 				log.Fatal("Error reading page", err)
 			}
