@@ -423,19 +423,17 @@ func ReadIndexPageBody(r io.ReadSeeker, numCells uint16, pageNum uint32, key str
 	debug(fmt.Sprintf("# of cells: %d", numCells))
 
 	rowIds := make([]int, 0)
+	var cmp int
 	for _, cp := range cellPointers {
 		JumpToPage(r, h.pageSize, pageNum, cp)
 		record, err := ReadIndexRecord(r, isInterior)
 		if err != nil {
 			return nil, err
 		}
-		cmp := strings.Compare(key, record.key)
-
-		if cmp == 0 {
-			rowIds = append(rowIds, int(record.rowId))
-		}
-		//recoreds = append(recoreds, *record)
-		if cmp < 0 {
+		debug(fmt.Sprintf("key: %v | record.key %v\n", key, record.key))
+		cmp = strings.Compare(key, record.key)
+		switch {
+		case cmp <= 0:
 			if isInterior {
 				// follow left
 				crowIds, err := ReadIndexPage(r, record.leftPageNum, key)
@@ -443,18 +441,26 @@ func ReadIndexPageBody(r io.ReadSeeker, numCells uint16, pageNum uint32, key str
 					return nil, err
 				}
 				rowIds = append(rowIds, *crowIds...)
-				return &rowIds, nil
-			} else { // leaf Node
-				return &rowIds, nil
 			}
+			if cmp == 0 {
+				rowIds = append(rowIds, int(record.rowId))
+			}
+		case cmp > 0:
+			break
 		}
 	}
 
 	if isInterior {
-		return ReadIndexPage(r, rightPageNum, key)
-	} else {
-		return &rowIds, nil
+		if cmp > 0 {
+			crowIds, err := ReadIndexPage(r, rightPageNum, key)
+			if err != nil {
+				return nil, err
+			}
+			rowIds = append(rowIds, *crowIds...)
+		}
 	}
+
+	return &rowIds, nil
 
 }
 
