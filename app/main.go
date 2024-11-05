@@ -206,6 +206,12 @@ func (c Column) StringVal() string {
 
 func (c Column) IntVal() int64 {
 	ctype := c.serialType.Type()
+	if ctype == ZeroInt {
+		return 0
+	}
+	if ctype == OneInt {
+		return 1
+	}
 	if !(ctype == Int8 || ctype == Int16 || ctype == Int24 || ctype == Int32) {
 		log.Fatalf("Column type is not Int8 / Int 16 / Int32. It is %v instead.", ctype)
 	}
@@ -505,11 +511,11 @@ func TraverseInteriorPage(r io.ReadSeeker, numCells uint16, pageNum uint32, righ
 				break
 			}
 			srowId, _ := rowIds.Top()
-			if rowId < int64(srowId) {
+			if int64(srowId) > rowId {
 				continue
+				//break -- why not?
 			}
 		}
-
 		childRecs, err := ReadTablePage(r, childPageNum, rowIds)
 		if err != nil {
 			return nil, err
@@ -521,10 +527,10 @@ func TraverseInteriorPage(r io.ReadSeeker, numCells uint16, pageNum uint32, righ
 		if rowIds.IsEmpty() {
 			return &recs, nil
 		}
-		srowId, _ := rowIds.Top()
-		if rowId < int64(srowId) {
-			return &recs, nil
-		}
+		//srowId, _ := rowIds.Top()
+		//if int64(srowId) > rowId {
+		//	return &recs, nil
+		//} -- why???
 	}
 
 	cRecs, err := ReadTablePage(r, rightPageNum, rowIds)
