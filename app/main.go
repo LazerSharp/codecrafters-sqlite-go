@@ -263,7 +263,7 @@ func readPayload(r io.Reader) (*[]Column, error) {
 	//fmt.Printf("Size of header %v, bytes in hdrSize %v \n", hdrSize, nbytes)
 	// Parse Seial types of columns
 	hBytesLeft := hdrSize - int64(nbytes)
-	debug(fmt.Sprintf("Bytes for columns: %d", hBytesLeft))
+	//debug(fmt.Sprintf("Bytes for columns: %d", hBytesLeft))
 
 	collSerialTypes := make([]ColumnSerialType, 0)
 
@@ -271,12 +271,12 @@ func readPayload(r io.Reader) (*[]Column, error) {
 		if hBytesLeft <= 0 {
 			break
 		}
-		debug("Parsing Serial type ...")
+		//debug("Parsing Serial type ...")
 		stype, nb, err := ParseVarint(r)
 		if err != nil {
 			return nil, err
 		}
-		debug(fmt.Sprintf("Serial type [%d] nbytes = [%d]", stype, nbytes))
+		//debug(fmt.Sprintf("Serial type [%d] nbytes = [%d]", stype, nbytes))
 		serialType := ColumnSerialType(stype)
 		collSerialTypes = append(collSerialTypes, serialType)
 		hBytesLeft -= int64(nb)
@@ -287,7 +287,7 @@ func readPayload(r io.Reader) (*[]Column, error) {
 
 	columns := make([]Column, 0, len(collSerialTypes))
 
-	debug(fmt.Sprintf("No of columns: %d", len(collSerialTypes)))
+	//debug(fmt.Sprintf("No of columns: %d", len(collSerialTypes)))
 
 	for _, collSerialType := range collSerialTypes {
 		column, err := ReadColumn(&collSerialType, r)
@@ -428,36 +428,69 @@ func ReadIndexPageBody(r io.ReadSeeker, numCells uint16, pageNum uint32, key str
 	}
 	debug(fmt.Sprintf("# of cells: %d", numCells))
 
+	if isInterior {
+		debug(fmt.Sprintln("Entering Interior page :", pageNum))
+	} else {
+		debug(fmt.Sprintln("Entering Leaf page :", pageNum))
+	}
+
 	rowIds := make([]int, 0)
+	var lastCellIndex int
 	var cmp int
-	for _, cp := range cellPointers {
+	var record *IndexRecord
+loop:
+	for i, cp := range cellPointers {
 		JumpToPage(r, h.pageSize, pageNum, cp)
-		record, err := ReadIndexRecord(r, isInterior)
+		var err error
+		record, err = ReadIndexRecord(r, isInterior)
 		if err != nil {
 			return nil, err
 		}
-		debug(fmt.Sprintf("key: %v | record.key %v\n", key, record.key))
+		lastCellIndex = i
 		cmp = strings.Compare(key, record.key)
-		switch {
-		case cmp <= 0:
-			if isInterior {
+
+		if isInterior {
+			debug(fmt.Sprintf("key(%v) > record.key(%v) ==> %v\n", key, record.key, cmp))
+			switch {
+			case cmp <= 0:
+				debug(fmt.Sprintf("\n\n ----> \"%s\" Directing to Left page[%d] of key #[%s] \n\n", key, record.leftPageNum, record.key))
 				// follow left
 				crowIds, err := ReadIndexPage(r, record.leftPageNum, key)
 				if err != nil {
 					return nil, err
 				}
 				rowIds = append(rowIds, *crowIds...)
+				debug(fmt.Sprintf("row Ids : %v ", rowIds))
+				if cmp == 0 {
+
+					debug("row Id found")
+					rowIds = append(rowIds, int(record.rowId))
+				}
+				break loop
+			case cmp > 0:
+				//fmt.Println("Not found exiting...")
+				continue
 			}
-			if cmp == 0 {
+		} else { // leaf
+			switch {
+			case cmp < 0:
+				debug(fmt.Sprintf(" => %d>>> \"%s\" Leaf: No more Match found key #[%s] \n\n", i, key, record.key))
+				break loop
+				//return &rowIds, nil
+			case cmp == 0:
+				debug(fmt.Sprintf(" => %d>>> \"%s\" Leaf: Match found key #[%s] \n\n", i, key, record.key))
 				rowIds = append(rowIds, int(record.rowId))
+			case cmp > 0:
+				debug(fmt.Sprintf(" => %d>>> \"%s\" Leaf: Skipping key #[%s] \n\n", i, key, record.key))
+				continue
 			}
-		case cmp > 0:
-			break
 		}
 	}
 
 	if isInterior {
-		if cmp > 0 {
+		if lastCellIndex == (len(cellPointers)-1) && cmp > 0 {
+
+			debug(fmt.Sprintf("\n\n ----> \"%s\" Directing to Right page[%d] of key #[%s] \n\n", key, rightPageNum, record.key))
 			crowIds, err := ReadIndexPage(r, rightPageNum, key)
 			if err != nil {
 				return nil, err
@@ -793,7 +826,7 @@ func main() {
 					log.Fatal("Error reading Index page", err)
 				}
 				for _, rowId := range *rowIds {
-					fmt.Println(fmt.Sprintf("rowId: %v", rowId))
+					debug(fmt.Sprintf(">>>>>>>>>>>>>> rowId: %v", rowId))
 				}
 
 				rowIdentifiers = NewQ(*rowIds)
